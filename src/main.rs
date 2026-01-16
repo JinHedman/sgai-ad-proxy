@@ -49,6 +49,7 @@ lazy_static::lazy_static! {
 enum RequestType {
     MasterPlayList,
     MediaPlayList,
+    Playlist, // Unknown playlist type (origin host mode)
     Segment,
     Other,
 }
@@ -182,15 +183,21 @@ struct CliArguments {
     /// Proxy port
     listen_port: u16,
 
-    /// HLS stream address (protocol://ip:port/path)
-    /// (e.g., http://localhost/test/master.m3u8)
-    #[clap(verbatim_doc_comment)]
-    master_playlist_url: String,
-
     /// Ad server endpoint (protocol://ip:port/path)
     /// It should be a VAST4.0/4.1 XML compatible endpoint
     #[clap(verbatim_doc_comment)]
     ad_server_endpoint: String,
+
+    /// HLS stream address (protocol://ip:port/path)
+    /// (e.g., http://localhost/test/master.m3u8)
+    /// Required unless --origin-host is provided
+    #[clap(required_unless_present = "origin_host", verbatim_doc_comment)]
+    master_playlist_url: Option<String>,
+
+    /// Origin host URL (protocol://host:port) to proxy any stream from
+    /// Use this instead of master_playlist_url to proxy multiple streams
+    #[clap(long, verbatim_doc_comment)]
+    origin_host: Option<String>,
 
     /// Ad insertion mode to use:
     /// 1) static  - add interstitial every 30 seconds (1000 in total).
@@ -241,7 +248,7 @@ impl InsertionMode {
 struct ServerConfig {
     forward_url: Url,
     interstitials_address: Url,
-    master_playlist_path: String,
+    master_playlist_path: Option<String>,
     insertion_mode: InsertionMode,
     target_ad_duration: u64,
     target_repeating_cycle: u64,
@@ -253,7 +260,7 @@ impl ServerConfig {
     fn new(
         forward_url: Url,
         interstitials_address: Url,
-        master_playlist_path: String,
+        master_playlist_path: Option<String>,
         insertion_mode: InsertionMode,
         target_ad_duration: u64,
         target_repeating_cycle: u64,
@@ -276,7 +283,7 @@ impl ServerConfig {
         object! {
             "forward_url": self.forward_url.as_str(),
             "interstitials_address": self.interstitials_address.as_str(),
-            "master_playlist_path": self.master_playlist_path.clone(),
+            "master_playlist_path": self.master_playlist_path.clone().unwrap_or_default(),
             "insertion_mode": self.insertion_mode.to_str(),
             "target_ad_duration": self.target_ad_duration,
             "target_repeating_cycle": self.target_repeating_cycle,
@@ -321,15 +328,24 @@ impl InsertionCommand {
 
 fn get_request_type(req: &HttpRequest, config: &web::Data<ServerConfig>) -> RequestType {
     let path = req.uri().path();
-    if path.contains(config.master_playlist_path.as_str()) {
-        return RequestType::MasterPlayList;
-    } else if is_media_segment(path) {
+
+    // In specific playlist mode, check for master playlist path
+    if let Some(ref master_path) = config.master_playlist_path {
+        if path.contains(master_path.as_str()) {
+            return RequestType::MasterPlayList;
+        }
+    }
+
+    if is_media_segment(path) {
         return RequestType::Segment;
     } else if path.ends_with(".m3u8") {
+        // In origin host mode (master_playlist_path is None), return generic Playlist
+        if config.master_playlist_path.is_none() {
+            return RequestType::Playlist;
+        }
         return RequestType::MediaPlayList;
-    } else {
-        return RequestType::Other;
     }
+    RequestType::Other
 }
 
 async fn build_ad_server_url(
@@ -910,6 +926,9 @@ async fn handle_media_stream(
         RequestType::MediaPlayList => {
             handle_media_playlist(req, available_slots, config, client).await
         }
+        RequestType::Playlist => {
+            handle_playlist(req, available_slots, config, client, user_defined_query_params).await
+        }
         RequestType::Segment => handle_segment(req, config, client).await,
         RequestType::Other => Ok(HttpResponse::NotFound().finish()),
     }
@@ -998,13 +1017,80 @@ async fn handle_media_playlist(
             .body(payload.clone()));
     }
 
-    let mut playlist = playlist.unwrap();
+    let playlist = playlist.unwrap();
+    handle_media_playlist_content(playlist, available_slots, config).await
+}
+
+async fn handle_master_playlist_content(
+    req: HttpRequest,
+    mut playlist: MasterPlaylist<'_>,
+    user_defined_query_params: web::Data<UserDefinedQueryParams>,
+) -> Result<HttpResponse, Error> {
+    // Save the user-defined query parameters for later use
+    if let Some(query_params) = req.uri().query() {
+        if let Some(playback_session_id) = get_header_value(&req, "x-playback-session-id") {
+            log::info!("Saved user-defined query parameters: {query_params} for session {playback_session_id}");
+            user_defined_query_params.0.insert(
+                Uuid::parse_str(&playback_session_id).unwrap_or_default(),
+                query_params.to_string(),
+            );
+        }
+    }
+
+    replace_absolute_url_with_relative_url(&mut playlist);
+    log::debug!("master playlist \n{playlist}");
+
+    Ok(HttpResponse::Ok()
+        .content_type(HLS_PLAYLIST_CONTENT_TYPE)
+        .body(playlist.to_string()))
+}
+
+async fn handle_media_playlist_content(
+    mut playlist: MediaPlaylist<'_>,
+    available_slots: web::Data<AvailableAdSlots>,
+    config: web::Data<ServerConfig>,
+) -> Result<HttpResponse, Error> {
     insert_interstitials(&mut playlist, &config, available_slots);
     log::debug!("media playlist \n{playlist}");
 
     Ok(HttpResponse::Ok()
         .content_type(HLS_PLAYLIST_CONTENT_TYPE)
         .body(playlist.to_string()))
+}
+
+async fn handle_playlist(
+    req: HttpRequest,
+    available_slots: web::Data<AvailableAdSlots>,
+    config: web::Data<ServerConfig>,
+    client: web::Data<Client>,
+    user_defined_query_params: web::Data<UserDefinedQueryParams>,
+) -> Result<HttpResponse, Error> {
+    let new_url = build_forward_url(&req, &config.forward_url);
+
+    let mut res = client
+        .get(new_url.as_str())
+        .send()
+        .await
+        .map_err(error::ErrorBadGateway)?;
+
+    let payload = res.body().await.map_err(error::ErrorBadGateway)?;
+    let m3u8 = std::str::from_utf8(&payload).map_err(error::ErrorBadRequest)?;
+
+    // Try parsing as master playlist first
+    if let Ok(master) = MasterPlaylist::try_from(m3u8) {
+        return handle_master_playlist_content(req, master, user_defined_query_params).await;
+    }
+
+    // Otherwise handle as media playlist
+    if let Ok(media) = MediaPlaylist::try_from(m3u8) {
+        return handle_media_playlist_content(media, available_slots, config).await;
+    }
+
+    // If neither parsing works, return the original content
+    log::warn!("Could not parse playlist as master or media playlist, returning original");
+    Ok(HttpResponse::Ok()
+        .content_type(HLS_PLAYLIST_CONTENT_TYPE)
+        .body(payload))
 }
 
 async fn handle_segment(
@@ -1125,25 +1211,29 @@ async fn main() -> io::Result<()> {
     let (default_ad_duration, default_repeating_cycle, default_ad_number) =
         parse_default_values(&args);
 
-    let master_playlist_url =
-        Url::parse(&args.master_playlist_url).expect("Invalid master playlist URL");
-
     let client_tls_config = Arc::new(rustls_config());
-    // Inspect the master playlist to ensure it's valid
-    inspect_master_playlist(client_tls_config.clone(), &master_playlist_url)
-        .await
-        .expect("Failed to inspect master playlist");
+
+    // Determine mode and set forward_url and master_playlist_path
+    let (forward_url, master_playlist_path) = if let Some(ref origin) = args.origin_host {
+        // Origin host mode
+        let url = Url::parse(origin).expect("Invalid origin host URL");
+        (url, None)
+    } else {
+        // Specific playlist mode (existing behavior)
+        let master_url = Url::parse(args.master_playlist_url.as_ref().unwrap())
+            .expect("Invalid master playlist URL");
+        inspect_master_playlist(client_tls_config.clone(), &master_url)
+            .await
+            .expect("Failed to inspect master playlist");
+        let forward_url = base_url(&master_url).expect("Invalid forward URL");
+        let playlist_path = master_url.path().to_string();
+        (forward_url, Some(playlist_path))
+    };
 
     let test_asset = parse_test_asset_url(client_tls_config.clone(), &args.test_asset_url).await;
 
-    // Forward URL is the base URL of the master playlist
-    let forward_url = base_url(&master_playlist_url).expect("Invalid forward URL");
-    let playlist_path = master_playlist_url.path();
-
     let listen_url = format!("http://{}:{}", &args.listen_addr, &args.listen_port);
     let listen_url = Url::parse(&listen_url).expect("Invalid listen address");
-    let proxied_playlist_path = listen_url.join(playlist_path)
-        .expect("Failed to join listen URL with playlist path");
 
     let interstitials_address = if args.interstitials_address.is_empty() {
         format!("http://localhost:{}", &args.listen_port)
@@ -1166,7 +1256,14 @@ async fn main() -> io::Result<()> {
         default_repeating_cycle,
         default_ad_number
     );
-    log::info!("Proxied stream will be available at: {proxied_playlist_path}");
+
+    if let Some(ref playlist_path) = master_playlist_path {
+        let proxied_playlist_path = listen_url.join(playlist_path)
+            .expect("Failed to join listen URL with playlist path");
+        log::info!("Proxied stream will be available at: {proxied_playlist_path}");
+    } else {
+        log::info!("Origin host mode enabled - any stream path will be proxied");
+    }
 
     if let Some(ref asset) = test_asset {
         log::info!("Test asset URL: {}, duration: {}s", asset.url, asset.duration);
@@ -1183,7 +1280,7 @@ async fn main() -> io::Result<()> {
     let server_config = ServerConfig::new(
         forward_url,
         interstitials_address,
-        playlist_path.to_string(),
+        master_playlist_path,
         args.ad_insertion_mode,
         target_ad_duration,
         default_repeating_cycle,

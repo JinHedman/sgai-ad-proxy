@@ -11,7 +11,7 @@ if [ -z "$ORIGIN_URL" ]; then
 fi
 
 /app/ad_proxy 0.0.0.0 ${PORT:-8080} \
-  ${ORIGIN_URL} \
   ${VAST_ENDPOINT} \
+  ${ORIGIN_URL} \
   --ad-insertion-mode ${INSERTION_MODE:-static} \
   --interstitials-address https://${OSC_HOSTNAME}
