@@ -18,7 +18,7 @@ This application is a simple **http** proxy server that inserts ads into a video
 ## Data Flow
 
 The main data flow of Server-Guided Ad Insertion is shown below:
-![dataflow](docs/dataflow.png)
+![SBSSDK End-to-End Ad Insertion Flow](docs/dataflow.png)
 
 ## Evaluate in Open Source Cloud
 
