@@ -39,6 +39,7 @@ const HLS_PRIMARY_ID: &str = "_HLS_primary_id";
 const AD_ID: &str = "_ad_id";
 
 const APPLICATION_XML: &str = "application/xml";
+const AD_MEDIA_PATH: &str = "/ad-media";
 
 // Get the start time of the program as a static DateTime
 lazy_static::lazy_static! {
@@ -118,6 +119,7 @@ struct AdSlot {
     start_time: chrono::DateTime<chrono::Local>,
     duration: u64,
     pod_num: u64,
+    presentation: AdPresentation,
 }
 
 impl AdSlot {
@@ -141,6 +143,7 @@ impl AvailableAdSlots {
                     "start_time": slot.start_time.to_rfc3339(),
                     "duration": slot.duration,
                     "pod_num": slot.pod_num,
+                    "presentation": slot.presentation.to_json(),
                 }
             })
             .collect::<Vec<_>>();
@@ -149,6 +152,92 @@ impl AvailableAdSlots {
             "count": slots.len(),
             "slots": slots,
         }
+    }
+}
+
+impl AvailableAdSlots {
+    fn find_by_name(&self, name: &str) -> Option<AdPresentation> {
+        self.0
+            .iter()
+            .find(|slot| slot.name() == name)
+            .map(|slot| slot.presentation.clone())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum AdPresentationMode {
+    Linear,
+    NonLinear,
+}
+
+impl AdPresentationMode {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "non-linear" => Self::NonLinear,
+            _ => Self::Linear,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Linear => "linear",
+            Self::NonLinear => "non-linear",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum AdPlacement {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+    SideBySide,
+}
+
+impl AdPlacement {
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "top-left" => Some(Self::TopLeft),
+            "top-right" => Some(Self::TopRight),
+            "bottom-left" => Some(Self::BottomLeft),
+            "bottom-right" => Some(Self::BottomRight),
+            "side-by-side" => Some(Self::SideBySide),
+            _ => None,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            Self::TopLeft => "top-left",
+            Self::TopRight => "top-right",
+            Self::BottomLeft => "bottom-left",
+            Self::BottomRight => "bottom-right",
+            Self::SideBySide => "side-by-side",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AdPresentation {
+    mode: AdPresentationMode,
+    placement: Option<AdPlacement>,
+}
+
+impl AdPresentation {
+    fn linear() -> Self {
+        Self {
+            mode: AdPresentationMode::Linear,
+            placement: None,
+        }
+    }
+
+    fn to_json(&self) -> json::JsonValue {
+        let mut obj = object! { "mode": self.mode.as_str() };
+        if let Some(ref placement) = self.placement {
+            obj["placement"] = placement.as_str().into();
+        }
+        obj
     }
 }
 
@@ -298,6 +387,7 @@ struct InsertionCommand {
     in_sec: u64,
     duration: u64,
     pod_num: u64,
+    presentation: AdPresentation,
 }
 
 impl InsertionCommand {
@@ -305,23 +395,42 @@ impl InsertionCommand {
         let mut in_sec = None;
         let mut duration = None;
         let mut pod_num = None;
+        let mut mode_str: Option<String> = None;
+        let mut placement_str: Option<String> = None;
 
         for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
             match key.as_ref() {
                 "in" => in_sec = value.parse().ok(),
                 "dur" => duration = value.parse().ok(),
                 "pod" => pod_num = value.parse().ok(),
+                "mode" => mode_str = Some(value.to_string()),
+                "placement" => placement_str = Some(value.to_string()),
                 _ => {}
             }
         }
+
+        let mode = mode_str
+            .as_deref()
+            .map(AdPresentationMode::from_str)
+            .unwrap_or(AdPresentationMode::Linear);
+
+        let placement = if mode == AdPresentationMode::NonLinear {
+            placement_str
+                .as_deref()
+                .and_then(AdPlacement::from_str)
+                .or(Some(AdPlacement::BottomRight))
+        } else {
+            None
+        };
 
         match (in_sec, duration, pod_num) {
             (Some(in_sec), Some(duration), Some(pod_num)) => Ok(Self {
                 in_sec,
                 duration,
                 pod_num,
+                presentation: AdPresentation { mode, placement },
             }),
-            _ => Err("Missing required query parameters".to_string()),
+            _ => Err("Missing required query parameters: in, dur, pod".to_string()),
         }
     }
 }
@@ -466,7 +575,7 @@ fn to_tracking_json(tracking: &Tracking) -> json::JsonValue {
 
 }
 
-fn to_ad_asset_json(url: &str, ad: &Ad, start: u64) -> json::JsonValue {
+fn to_ad_asset_json(url: &str, ad: &Ad, start: u64, presentation: &AdPresentation) -> json::JsonValue {
     object! {
         "URI": url,
         "DURATION": ad.duration,
@@ -474,9 +583,10 @@ fn to_ad_asset_json(url: &str, ad: &Ad, start: u64) -> json::JsonValue {
             "version": 2,
             "type": "slot",
             "payload": object! {
-                "type": "linear",
+                "type": presentation.mode.as_str(),
                 "start": start,
                 "duration": ad.duration,
+                "presentation": presentation.to_json(),
                 "identifiers": ad.universal_ad_ids.iter().map(|id| {
                     object! {
                         "scheme": id.scheme.as_str(),
@@ -510,6 +620,7 @@ fn wrap_into_assets(
     user_id: &str,
     test_asset: &Option<TestAsset>,
     available_ads: web::Data<AvailableAds>,
+    presentation: &AdPresentation,
 ) -> String {
     let mut start_offset: u64 = 0;
     // Get all linears (regular MP4s) from the VAST
@@ -520,7 +631,7 @@ fn wrap_into_assets(
                 let ad = make_test_ad_from_creative(creative, &test_asset.as_ref().unwrap());
                 
                 start_offset += ad.duration;
-                to_ad_asset_json(&ad.url, &ad, start_offset)
+                to_ad_asset_json(&ad.url, &ad, start_offset, presentation)
             } else {
                 let ad = make_new_ad_from_creative(creative);
                 let id = ad.ad_id;
@@ -537,7 +648,7 @@ fn wrap_into_assets(
                     .append_pair(AD_ID, &id.to_string());
 
                 start_offset += ad.duration;
-                to_ad_asset_json(&url.as_str(), &ad, start_offset)
+                to_ad_asset_json(&url.as_str(), &ad, start_offset, presentation)
             };
 
             asset
@@ -551,7 +662,7 @@ fn wrap_into_assets(
             let id = ad.ad_id;
             log::info!("Processing transcoded asset {id}, tracking: {:?}", ad.tracking);
 
-            let asset = to_ad_asset_json(&ad.url, &ad, start_offset);
+            let asset = to_ad_asset_json(&ad.url, &ad, start_offset, presentation);
             start_offset += ad.duration;
 
             asset
@@ -600,6 +711,7 @@ fn generate_static_ad_slots(ad_duration:u64, every:u64, number: u64, date_time: 
                 start_time: start_time,
                 duration: ad_duration,
                 pod_num: 2,
+                presentation: AdPresentation::linear(),
             }
         })
         .collect()
@@ -731,13 +843,32 @@ fn insert_interstitials(
                         )
                         .duration(Duration::from_secs_f32(slot_duration))
                         .insert_client_attribute("X-ASSET-LIST", Value::String(url.into()))
-                        .insert_client_attribute("X-SNAP", Value::String("IN,OUT".into()))
-                        .insert_client_attribute("X-RESTRICT", Value::String("SKIP,JUMP".into()));
-                    if is_vod {
-                        // Set the resume offset to 0 for VOD streams
+                        .insert_client_attribute("X-SNAP", Value::String("IN,OUT".into()));
+                    // Non-linear ads must be skippable by the SDK (only restrict JUMP).
+                    // Linear ads restrict both SKIP and JUMP so HLS.js plays them normally.
+                    let restrict = match ad_slot.presentation.mode {
+                        AdPresentationMode::NonLinear => "JUMP",
+                        AdPresentationMode::Linear => "SKIP,JUMP",
+                    };
+                    date_range.insert_client_attribute("X-RESTRICT", Value::String(restrict.into()));
+                    // Non-linear ads: always resume at offset 0 so HLS.js primaryFallback
+                    // (triggered when the asset can't be buffered before skip() is called)
+                    // doesn't cause a visible forward jump in the live stream.
+                    let is_non_linear = ad_slot.presentation.mode == AdPresentationMode::NonLinear;
+                    if is_vod || is_non_linear {
                         date_range.insert_client_attribute(
                             "X-RESUME-OFFSET",
                             Value::Float(hls_m3u8::types::Float::new(0.0)),
+                        );
+                    }
+                    // CUE=ONCE tells HLS.js the interstitial plays only once and the
+                    // primary stream resumes from the same position — this allows
+                    // appendInPlace=true (lightweight MediaSource transfer) instead of
+                    // a full detach/reattach cycle, eliminating the ~195ms black flash.
+                    if is_non_linear {
+                        date_range.insert_client_attribute(
+                            "CUE",
+                            Value::String("ONCE".into()),
                         );
                     }
                     let date_range = date_range
@@ -782,6 +913,7 @@ async fn handle_commands(
                 start_time: start_time,
                 duration: command.duration,
                 pod_num: command.pod_num,
+                presentation: command.presentation.clone(),
             };
             log::debug!("Received ad slot: {:?}", ad_slot);
             available_slots.0.insert(ad_slot);
@@ -793,6 +925,7 @@ async fn handle_commands(
                     "in_sec": command.in_sec,
                     "duration": command.duration,
                     "pod_num": command.pod_num,
+                    "presentation": command.presentation.to_json(),
                 }
             };
             Ok(HttpResponse::Ok()
@@ -830,7 +963,7 @@ async fn handle_interstitials(
     
     // For non-transcoded ads
     if let Some(linear_id) = get_query_param(&req, AD_ID) {
-        return handle_raw_asset_request(&interstitial_id, &linear_id, &user_id, available_ads)
+        return handle_raw_asset_request(&interstitial_id, &linear_id, &user_id, available_ads, &config.interstitials_address)
             .await;
     }
     log::info!("Received interstitial request from user {user_id} for slot {interstitial_id}");
@@ -861,8 +994,13 @@ async fn handle_interstitials(
         })
         // Return an empty VAST in case of parsing error
         .unwrap_or_default();
+    // Resolve the presentation for this interstitial from the stored ad slot (default: linear)
+    let presentation = available_slots
+        .find_by_name(&interstitial_id)
+        .unwrap_or_else(AdPresentation::linear);
+
     // Wrap the VAST into JSON
-    let response = wrap_into_assets(vast, req_url, &interstitial_id, &user_id, &config.test_asset, available_ads);
+    let response = wrap_into_assets(vast, req_url, &interstitial_id, &user_id, &config.test_asset, available_ads, &presentation);
     log::info!("asset json reply \n{response}");
 
     Ok(HttpResponse::Ok()
@@ -875,6 +1013,7 @@ async fn handle_raw_asset_request(
     linear_id: &str,
     user_id: &str,
     available_ads: web::Data<AvailableAds>,
+    interstitials_address: &Url,
 ) -> Result<HttpResponse, Error> {
     log::info!(
         "Received follow-up interstitial request for slot {ad_slot_id} with id {linear_id} from user {user_id}"
@@ -886,9 +1025,11 @@ async fn handle_raw_asset_request(
         .get(&Uuid::parse_str(linear_id).unwrap_or_default())
         .ok_or_else(|| error::ErrorNotFound("Ad not found".to_string()))?;
 
+    let proxied_url = format!("{}ad-media?{}={}", interstitials_address, AD_ID, linear_id);
+
     let segment = MediaSegment::builder()
         .duration(Duration::from_secs(linear.duration))
-        .uri(linear.url.clone())
+        .uri(proxied_url)
         .build()
         .unwrap();
 
@@ -907,6 +1048,39 @@ async fn handle_raw_asset_request(
     Ok(HttpResponse::Ok()
         .content_type(HLS_PLAYLIST_CONTENT_TYPE)
         .body(m3u8.to_string()))
+}
+
+async fn handle_ad_media(
+    req: HttpRequest,
+    available_ads: web::Data<AvailableAds>,
+    client: web::Data<Client>,
+) -> Result<HttpResponse, Error> {
+    let ad_id = get_query_param(&req, AD_ID)
+        .ok_or_else(|| error::ErrorBadRequest("Missing _ad_id parameter".to_string()))?;
+
+    let ad_url = {
+        let linear = available_ads
+            .linears
+            .get(&Uuid::parse_str(&ad_id).unwrap_or_default())
+            .ok_or_else(|| error::ErrorNotFound("Ad not found".to_string()))?;
+        linear.url.clone()
+    };
+
+    log::info!("Proxying ad media: {ad_url}");
+
+    let mut upstream = client.get(&ad_url);
+    if let Some(range) = req.headers().get(header::RANGE) {
+        upstream = upstream.insert_header((header::RANGE, range.clone()));
+    }
+
+    let res = upstream
+        .send()
+        .await
+        .map_err(error::ErrorInternalServerError)?;
+
+    let mut client_resp = HttpResponse::build(res.status());
+    copy_headers(&res, &mut client_resp);
+    Ok(client_resp.streaming(res))
 }
 
 async fn handle_media_stream(
@@ -1307,6 +1481,7 @@ async fn main() -> io::Result<()> {
             .route(COMMAND_PREFIX, web::get().to(handle_commands))
             .route(STATUS_PREFIX, web::get().to(handle_status))
             .route(INTERSTITIAL_PLAYLIST, web::get().to(handle_interstitials))
+            .route(AD_MEDIA_PATH, web::get().to(handle_ad_media))
             .default_service(web::to(handle_media_stream))
     })
     .bind((args.listen_addr, args.listen_port))?
